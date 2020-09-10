@@ -7,22 +7,12 @@
 #include <string.h>
 #include <cstdlib>
 #include <stdio.h>
-#include <memory>
 #include <sys/shm.h>
 #include <cmath>
 #include "shmmqueue.h"
 
 namespace shmmqueue
 {
-CMessageQueue::CMessageQueue(BYTE *pCurrAddr)
-{
-    m_pShm = (void*) pCurrAddr;
-    m_pQueueAddr = pCurrAddr;
-    m_stMemTrunk = new (m_pQueueAddr) stMemTrunk();
-    m_pQueueAddr += sizeof(stMemTrunk);
-    InitLock();
-}
-
 CMessageQueue::CMessageQueue(BYTE *pCurrAddr, eQueueModel module, key_t shmKey, int shmId, size_t size)
 {
     m_pShm = (void*) pCurrAddr;
@@ -46,11 +36,11 @@ CMessageQueue::~CMessageQueue()
     }
     if (m_pBeginLock) {
         delete m_pBeginLock;
-        m_pBeginLock = nullptr;
+        m_pBeginLock = NULL;
     }
     if (m_pEndLock) {
         delete m_pEndLock;
-        m_pEndLock = nullptr;
+        m_pEndLock = NULL;
     }
 }
 
@@ -60,10 +50,10 @@ int CMessageQueue::SendMessage(BYTE *message, MESS_SIZE_TYPE length)
         return (int) eQueueErrorCode::QUEUE_PARAM_ERROR;
     }
 
-    std::shared_ptr<CSafeShmWlock> lock = nullptr;
+    CSafeShmWlock tmLock;
     //修改共享内存写锁
     if (IsEndLock() && m_pEndLock) {
-        lock.reset(new CSafeShmWlock(m_pEndLock));
+        tmLock.InitLock(m_pEndLock);
     }
 
     // 首先判断是否队列已满
@@ -78,11 +68,10 @@ int CMessageQueue::SendMessage(BYTE *message, MESS_SIZE_TYPE length)
     }
 
     MESS_SIZE_TYPE usInLength = length;
-
     BYTE *pTempDst = m_pQueueAddr;
     BYTE *pTempSrc = (BYTE *) (&usInLength);
 
-    //写入的时候我们在数据头插上数据的长度，方便准确取数据
+    //写入的时候我们在数据头插上数据的长度，方便准确取数据,每次写入一个字节可能会分散在队列的头和尾
     unsigned int tmpEnd = m_stMemTrunk->m_iEnd;
     for (MESS_SIZE_TYPE i = 0; i < sizeof(usInLength); i++) {
         pTempDst[tmpEnd] = pTempSrc[i];  // 拷贝 Code 的长度
@@ -114,10 +103,10 @@ int CMessageQueue::GetMessage(BYTE *pOutCode)
         return (int) eQueueErrorCode::QUEUE_PARAM_ERROR;
     }
 
-    std::shared_ptr<CSafeShmWlock> lock = nullptr;
+    CSafeShmWlock tmLock;
     //修改共享内存写锁
     if (IsBeginLock() && m_pBeginLock) {
-        lock.reset(new CSafeShmWlock(m_pBeginLock));
+        tmLock.InitLock(m_pBeginLock);
     }
 
     int nTempMaxLength = GetDataSize();
@@ -178,10 +167,10 @@ int CMessageQueue::ReadHeadMessage(BYTE *pOutCode)
         return (int) eQueueErrorCode::QUEUE_PARAM_ERROR;
     }
 
-    std::shared_ptr<CSafeShmRlock> lock = nullptr;
+    CSafeShmRlock tmLock;
     //修改共享内存写锁
     if (IsBeginLock() && m_pBeginLock) {
-        lock.reset(new CSafeShmRlock(m_pBeginLock));
+        tmLock.InitLock(m_pBeginLock);
     }
 
     int nTempMaxLength = GetDataSize();
@@ -234,10 +223,10 @@ int CMessageQueue::ReadHeadMessage(BYTE *pOutCode)
   * */
 int CMessageQueue::DeleteHeadMessage()
 {
-    std::shared_ptr<CSafeShmWlock> lock = nullptr;
+    CSafeShmWlock tmLock;
     //修改共享内存写锁
     if (IsBeginLock() && m_pBeginLock) {
-        lock.reset(new CSafeShmWlock(m_pBeginLock));
+        tmLock.InitLock(m_pBeginLock);
     }
 
     int nTempMaxLength = GetDataSize();
@@ -273,8 +262,7 @@ int CMessageQueue::DeleteHeadMessage()
         return (int) eQueueErrorCode::QUEUE_DATA_SEQUENCE_ERROR;
     }
 
-    __WRITE_BARRIER__;
-    m_stMemTrunk->m_iBegin = (tmpBegin + usOutLength) % GetQueueLength();
+    m_stMemTrunk->m_iBegin = (tmpBegin + usOutLength) & (m_stMemTrunk->m_iSize -1);
     return usOutLength;
 }
 
@@ -323,11 +311,11 @@ unsigned int CMessageQueue::GetQueueLength()
 void CMessageQueue::InitLock()
 {
     if (IsBeginLock()) {
-        m_pBeginLock = new CShmRWlock((key_t) (m_stMemTrunk->m_iShmKey));
+        m_pBeginLock = new CShmRWlock((key_t) (m_stMemTrunk->m_iShmKey + 1));
     }
 
     if (IsEndLock()) {
-        m_pEndLock = new CShmRWlock((key_t) (m_stMemTrunk->m_iShmId));
+        m_pEndLock = new CShmRWlock((key_t) (m_stMemTrunk->m_iShmKey + 2));
     }
 }
 
@@ -359,10 +347,7 @@ BYTE *CMessageQueue::CreateShareMem(key_t iKey, long vSize, enShmModule &shmModu
     }
 
     iTempShmSize = (size_t) vSize;
-    //iTempShmSize += sizeof(CSharedMem);
-
     printf("Try to malloc share memory of %d bytes... \n", iTempShmSize);
-
     shmId = shmget(iKey, iTempShmSize, IPC_CREAT | IPC_EXCL | 0666);
     if (shmId < 0) {
         if (errno != EEXIST) {
@@ -372,21 +357,24 @@ BYTE *CMessageQueue::CreateShareMem(key_t iKey, long vSize, enShmModule &shmModu
         }
 
         printf("Same shm seg [key= %d] exist, now try to attach it... \n", iKey);
-
-        shmId = shmget(iKey, iTempShmSize, 0666);
+        shmId = shmget(iKey, iTempShmSize, IPC_CREAT | 0666);
         if (shmId < 0) {
-            printf("Attach to share memory [key= %d,shmId %d] failed, %s . Now try to touch it \n",iKey, shmId, strerror(errno));
+            printf("Attach to share memory [key= %d,shmId %d] failed,maybe the size of share memory changed,%s .now try to touch it again \n",
+                    iKey, shmId, strerror(errno));
+            //先获取之前的shmId
             shmId = shmget(iKey, 0, 0666);
             if (shmId < 0) {
                 printf("[%s:%d] Fatel error, touch to shm [key= %d,shmId %d] failed, %s.\n", __FILE__, __LINE__, iKey, shmId,strerror(errno));
                 exit(-1);
             }
             else {
+                //先删除之前的share memory
                 printf("First remove the exist share memory [key= %d,shmId %d] \n", iKey,shmId);
                 if (shmctl(shmId, IPC_RMID, NULL)) {
                     printf("[%s:%d] Remove share memory [key= %d,shmId %d] failed, %s \n", __FILE__, __LINE__, iKey,shmId,strerror(errno));
                     exit(-1);
                 }
+                //重新创建
                 shmId = shmget(iKey, iTempShmSize, IPC_CREAT | IPC_EXCL | 0666);
                 if (shmId < 0) {
                     printf("[%s:%d] Fatal error, alloc share memory [key= %d,shmId %d] failed, %s \n",
@@ -463,13 +451,19 @@ bool CMessageQueue::IsPowerOfTwo(size_t size) {
 }
 
 
-int CMessageQueue::CMessageQueue::Fls(size_t size) {
-    int r;
-    __asm__("bsrl %1,%0\n\t"
-            "jnz 1f\n\t"
-            "movl $-1,%0\n"
-            "1:" : "=r" (r) : "rm" (size));
-    return r+1;
+int CMessageQueue::Fls(size_t size) {
+    int position;
+    int i;
+    if(0 != size)
+    {
+        for (i = (size >> 1), position = 0; i != 0; ++position)
+            i >>= 1;
+    }
+    else
+    {
+        position = -1;
+    }
+    return position + 1;
 }
 
 size_t CMessageQueue::RoundupPowofTwo(size_t size) {
@@ -482,23 +476,17 @@ CMessageQueue *CMessageQueue::CreateInstance(key_t shmkey,
 {
     if(queuesize <= 0)
     {
-        return nullptr;
+        return NULL;
     }
 
     queuesize = IsPowerOfTwo(queuesize) ? queuesize : RoundupPowofTwo(queuesize);
     if(queuesize <= 0) {
-        return nullptr;
+        return NULL;
     }
     enShmModule shmModule;
     int shmId = 0;
     BYTE * tmpMem = CMessageQueue::CreateShareMem(shmkey, queuesize + sizeof(stMemTrunk), shmModule,shmId);
-    CMessageQueue *messageQueue;
-    if (shmModule == enShmModule::SHM_INIT) {
-        messageQueue = new CMessageQueue(tmpMem,queueModule, shmkey,shmId, queuesize);
-    }
-    else {
-        messageQueue = new CMessageQueue(tmpMem);
-    }
+    CMessageQueue *messageQueue = new CMessageQueue(tmpMem,queueModule, shmkey,shmId, queuesize);
     messageQueue->PrintTrunk();
     return messageQueue;
 }
